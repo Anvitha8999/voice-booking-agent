@@ -73,6 +73,8 @@ def book_appointment(args: BookAppointmentArgs) -> dict:
             if existing["customer_name"].lower() == name.lower():
                 return {
                     "success": True,
+                    "date": args.date.isoformat(),  # NEW
+                    "time": args.time,  # NEW
                     "already_booked": True,
                     "confirmation_id": existing["confirmation_id"],
                     "message": f"{name} is already booked on {args.date.isoformat()} at {args.time}.",
@@ -92,6 +94,8 @@ def book_appointment(args: BookAppointmentArgs) -> dict:
 
     return {
         "success": True,
+        "date": args.date.isoformat(),  # NEW
+        "time": args.time,  # NEW
         "confirmation_id": confirmation_id,
         "message": f"Booked {name} on {args.date.isoformat()} at {args.time}.",
     }

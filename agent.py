@@ -1,5 +1,6 @@
 import datetime as dt
 import json
+import os
 import re
 import sys
 import time
@@ -13,45 +14,60 @@ from booking import (
     book_appointment,
     check_availability,
 )
+from dates import resolve_date
 
-MODEL = "qwen2.5:3b"
-MAX_TOOL_ROUNDS = 4
+MODEL = os.environ.get("AGENT_MODEL", "qwen2.5:3b")
+MAX_TOOL_ROUNDS = 3
 MAX_OFFERED_SLOTS = 3
 KEEP_ALIVE = "30m"
+PLACEHOLDER_NAMES = {"user", "caller", "customer", "client", "guest", "unknown", "name"}
 
 YES_RE = re.compile(
     r"\b(yes|yeah|yep|yup|correct|confirm|confirmed|sure|go ahead|please do|that's right|sounds good)\b",
     re.IGNORECASE,
 )
 CLAIM_RE = re.compile(
-    r"(i('ve| have) booked|you('re| are) (all )?booked|booked you|is booked for|"
-    r"confirmation (code|number)|is confirmed|you're all set)",
+    r"(i('ve| have) (just )?booked|you('re| are) (all )?booked|booked you|"
+    r"(has|have) been booked|(appointment|you) (is|are) now booked|"
+    r"confirmation (code|number) is)",
     re.IGNORECASE,
 )
+WORD_RE = re.compile(r"[a-z']+")
+
 CORRECTION = (
-    "Correction: no booking has been made. Do not say an appointment is booked. "
-    "If the caller has confirmed the day, time, and name, call book_appointment now. "
-    "Otherwise, repeat the details and ask them to confirm."
+    "Correction: no booking has been made yet. Do not say it is booked. "
+    "If the caller already said yes, call book_appointment now. "
+    "Otherwise ask: Shall I book TIME on DATE for NAME?"
 )
+CONFIRM_FALLBACK = "Before I book anything, please confirm the day, the time, and your full name."
+GENERIC_FALLBACK = "Sorry, I'm having trouble with that. Could you say it another way?"
 
 TOOLS = {
     "check_availability": {
         "args_model": CheckAvailabilityArgs,
         "func": check_availability,
         "writes": False,
-        "description": "Check open appointment times for one date. Call this before offering any times.",
+        "llm_visible": False,
+        "description": "Check open appointment times for one date.",
     },
     "book_appointment": {
         "args_model": BookAppointmentArgs,
         "func": book_appointment,
         "writes": True,
-        "description": "Book an appointment. Only call after the caller has said yes to the date, time, and name.",
+        "llm_visible": True,
+        "description": "Book an appointment. Only call after the caller has said yes to the date, time, and their full name.",
     },
 }
 
 
 def log(text: str) -> None:
     print(f"\033[2m  [{text}]\033[0m", file=sys.stderr)
+
+
+def clean_for_speech(text: str) -> str:
+    text = re.sub(r"^\s*[-*•#]+\s*", "", text, flags=re.MULTILINE)
+    text = text.replace("*", "")
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def spoken_time(hhmm: str) -> str:
@@ -61,15 +77,24 @@ def spoken_time(hhmm: str) -> str:
     return f"{hour12} {suffix}" if minute == 0 else f"{hour12}:{minute:02d} {suffix}"
 
 
+def spoken_date(iso: str) -> str:
+    day = dt.date.fromisoformat(iso)
+    return f"{day:%A, %B} {day.day}"
+
+
 def present(name: str, result: dict) -> dict:
     """Reshape a tool result so a small model can speak it correctly."""
     out = dict(result)
-    if name == "check_availability" and out.get("slots"):
+    if out.get("date"):
+        out["say_date"] = spoken_date(out["date"])
+    if out.get("time"):
+        out["say_time"] = spoken_time(out["time"])
+    if "slots" in out:
         slots = out.pop("slots")
         out["offer_these_times"] = [
             {"time": t, "say": spoken_time(t)} for t in slots[:MAX_OFFERED_SLOTS]
         ]
-        out["other_open_times"] = slots[MAX_OFFERED_SLOTS:]
+        out["other_open_times"] = [spoken_time(t) for t in slots[MAX_OFFERED_SLOTS:]]
     if out.get("alternatives"):
         out["alternatives"] = [{"time": t, "say": spoken_time(t)} for t in out["alternatives"]]
     if out.get("confirmation_id"):
@@ -88,43 +113,38 @@ def tool_schemas() -> list[dict]:
             },
         }
         for name, spec in TOOLS.items()
+        if spec["llm_visible"]
     ]
 
 
 def system_prompt(today: dt.date) -> str:
-    lines = []
-    for i in range(14):
-        day = today + dt.timedelta(days=i)
-        label = " (today)" if i == 0 else ""
-        lines.append(f"- {day:%A %B %d}: {day.isoformat()}{label}")
-    calendar = "\n".join(lines)
-
     return f"""You are a phone scheduling assistant that books appointments.
-Today is {today:%A, %B %d, %Y}.
-Use this table to turn spoken dates into YYYY-MM-DD. Never calculate dates yourself:
-{calendar}
-
+Today is {today:%A, %B} {today.day}.
 We are open Monday to Friday. Appointments start on the hour.
 
+A caller's message may end with "(Booking system FACT: ...)". Facts are always correct.
+- Only mention dates and times that appear in a FACT or a tool result, using their say text.
+- If the caller asks about availability without naming a specific day, ask which day they want.
+
 Steps:
-1. Ask which day the caller wants and look it up in the table.
-2. Call check_availability. Offer only the times in offer_these_times, using their "say" text.
-3. Ask for the caller's full name.
-4. Repeat the full date, time, and name, and ask them to confirm.
+1. Ask which day the caller wants.
+2. When a FACT gives availability, offer the times in offer_these_times in one sentence.
+3. Once they pick a time, ask for their full name.
+4. Ask exactly: "Shall I book TIME on DATE for NAME?"
 5. Only after they say yes, call book_appointment.
 6. Read the confirmation code using say_code.
 
 Rules:
 - Ask only one question per reply.
 - Never say an appointment is booked unless book_appointment returned success.
-- Send times to tools as 24-hour HH:MM.
-- Reply in one or two short sentences with no lists or symbols, because your words will be spoken aloud."""
+- Send dates to tools as YYYY-MM-DD and times as 24-hour HH:MM.
+- Reply in one or two short sentences. No lists, bullets, or symbols, because your words will be spoken aloud."""
 
 
 def warm_up() -> None:
     start = time.perf_counter()
     ollama.generate(model=MODEL, prompt="", keep_alive=KEEP_ALIVE)
-    log(f"model loaded in {time.perf_counter() - start:.2f}s")
+    log(f"model {MODEL} loaded in {time.perf_counter() - start:.2f}s")
 
 
 class Session:
@@ -132,11 +152,28 @@ class Session:
         self.messages: list = [{"role": "system", "content": system_prompt(dt.date.today())}]
         self.checked_dates: set[dt.date] = set()
         self.confirmation_ids: set[str] = set()
+        self.user_words: set[str] = set()
         self.last_user_text = ""
+
+    def availability_fact(self, user_text: str) -> str | None:
+        day = resolve_date(user_text, dt.date.today())
+        if day is None:
+            return None
+        result = check_availability(CheckAvailabilityArgs(date=day))
+        self.checked_dates.add(day)
+        shown = present("check_availability", {**result, "date": day.isoformat()})
+        log(f"prefetch {day.isoformat()} -> {json.dumps(shown)}")
+        return json.dumps(shown)
+
+    def name_is_grounded(self, customer_name: str) -> bool:
+        words = WORD_RE.findall(customer_name.lower())
+        if not words or any(w in PLACEHOLDER_NAMES for w in words):
+            return False
+        return all(w in self.user_words for w in words)
 
     def run_tool(self, name: str, raw_args: dict, writes_this_turn: int) -> dict:
         spec = TOOLS.get(name)
-        if spec is None:
+        if spec is None or not spec["llm_visible"]:
             return {"error": f"Unknown tool '{name}'."}
 
         try:
@@ -147,22 +184,32 @@ class Session:
 
         if name == "book_appointment":
             if args.date not in self.checked_dates:
-                return {"error": "Call check_availability for this date before booking."}
+                return {"error": "That date has not been checked. Ask the caller which day they want."}
+            if not self.name_is_grounded(args.customer_name):
+                return {"error": "Ask the caller for their full name before booking."}
             if not YES_RE.search(self.last_user_text):
-                return {"error": "The caller has not confirmed yet. Repeat the date, time, and name, then ask them to confirm."}
+                return {"error": "The caller has not said yes yet. Ask: Shall I book TIME on DATE for NAME?"}
             if writes_this_turn >= 1:
                 return {"error": "Only one booking is allowed per turn."}
 
-        result = spec["func"](args)
-        if name == "check_availability":
-            self.checked_dates.add(args.date)
-        return result
+        return spec["func"](args)
+
+    def say(self, text: str) -> str:
+        """Record a code-generated reply in history so the model knows it was said."""
+        self.messages.append({"role": "assistant", "content": text})
+        return text
 
     def reply(self, user_text: str) -> str:
         self.last_user_text = user_text
-        self.messages.append({"role": "user", "content": user_text})
+        self.user_words.update(WORD_RE.findall(user_text.lower()))
+
+        fact = self.availability_fact(user_text)
+        content = user_text if fact is None else f"{user_text}\n\n(Booking system FACT: {fact})"
+        self.messages.append({"role": "user", "content": content})
+
         writes = 0
         booked_this_turn = False
+        blocked = 0
 
         for _ in range(MAX_TOOL_ROUNDS):
             start = time.perf_counter()
@@ -179,10 +226,16 @@ class Session:
             self.messages.append(message)
 
             if not message.tool_calls:
-                text = (message.content or "").strip()
+                text = clean_for_speech(message.content or "")
+                if not text:
+                    log("empty reply, retrying")
+                    continue
                 known_code = any(code in text for code in self.confirmation_ids)
                 if CLAIM_RE.search(text) and not booked_this_turn and not known_code:
+                    blocked += 1
                     log(f"guardrail: blocked unbacked booking claim: {text!r}")
+                    if blocked >= 2:
+                        return self.say(CONFIRM_FALLBACK)
                     self.messages.append({"role": "system", "content": CORRECTION})
                     continue
                 return text
@@ -202,7 +255,7 @@ class Session:
                 )
 
         log("hit MAX_TOOL_ROUNDS")
-        return "Sorry, I'm having trouble with that. Could you say it another way?"
+        return self.say(GENERIC_FALLBACK)
 
 
 def main() -> None:
