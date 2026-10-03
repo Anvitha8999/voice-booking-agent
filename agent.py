@@ -90,16 +90,25 @@ def present(name: str, result: dict) -> dict:
     if out.get("time"):
         out["say_time"] = spoken_time(out["time"])
     if "slots" in out:
+        out.pop("message", None)
         slots = out.pop("slots")
-        out["offer_these_times"] = [
-            {"time": t, "say": spoken_time(t)} for t in slots[:MAX_OFFERED_SLOTS]
-        ]
-        out["other_open_times"] = [spoken_time(t) for t in slots[MAX_OFFERED_SLOTS:]]
+        out["open_times"] = [spoken_time(t) for t in slots]
+        out["open_times_24h"] = slots
+        out["suggest_first"] = [spoken_time(t) for t in slots[:MAX_OFFERED_SLOTS]]
     if out.get("alternatives"):
-        out["alternatives"] = [{"time": t, "say": spoken_time(t)} for t in out["alternatives"]]
+        out["alternatives"] = [spoken_time(t) for t in out["alternatives"]]
     if out.get("confirmation_id"):
         out["say_code"] = " ".join(out["confirmation_id"])
     return out
+
+
+def booking_confirmation(shown: dict) -> str:
+    """Build the post-booking sentence from tool facts, not from the LLM."""
+    opener = "You're already booked" if shown.get("already_booked") else "You're booked"
+    return (
+        f"{opener} for {shown['say_time']} on {shown['say_date']}. "
+        f"Your confirmation code is {shown['say_code']}. Is there anything else I can help with?"
+    )
 
 
 def tool_schemas() -> list[dict]:
@@ -128,23 +137,32 @@ A caller's message may end with "(Booking system FACT: ...)". Facts are always c
 
 Steps:
 1. Ask which day the caller wants.
-2. When a FACT gives availability, offer the times in offer_these_times in one sentence.
+2. When a FACT gives availability, offer the times in suggest_first in one sentence. If the caller asks about other times, answer from open_times, which lists every open time.
 3. Once they pick a time, ask for their full name.
 4. Ask exactly: "Shall I book TIME on DATE for NAME?"
 5. Only after they say yes, call book_appointment.
-6. Read the confirmation code using say_code.
 
 Rules:
 - Ask only one question per reply.
+- If the caller's name is unclear, accept it as you heard it. Never ask for the name more than twice.
 - Never say an appointment is booked unless book_appointment returned success.
-- Send dates to tools as YYYY-MM-DD and times as 24-hour HH:MM.
+- Send dates to tools as YYYY-MM-DD and times as 24-hour HH:MM, using open_times_24h.
 - Reply in one or two short sentences. No lists, bullets, or symbols, because your words will be spoken aloud."""
 
 
 def warm_up() -> None:
     start = time.perf_counter()
-    ollama.generate(model=MODEL, prompt="", keep_alive=KEEP_ALIVE)
-    log(f"model {MODEL} loaded in {time.perf_counter() - start:.2f}s")
+    ollama.chat(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt(dt.date.today())},
+            {"role": "user", "content": "Hello"},
+        ],
+        tools=tool_schemas(),
+        options={"temperature": 0, "num_predict": 1},
+        keep_alive=KEEP_ALIVE,
+    )
+    log(f"model {MODEL} warmed up in {time.perf_counter() - start:.2f}s")
 
 
 class Session:
@@ -240,19 +258,24 @@ class Session:
                     continue
                 return text
 
+            confirmation = None
             for call in message.tool_calls:
                 name = call.function.name
                 raw_args = call.function.arguments
                 result = self.run_tool(name, raw_args, writes)
+                shown = present(name, result)
                 if TOOLS.get(name, {}).get("writes") and result.get("success"):
                     writes += 1
                     booked_this_turn = True
                     self.confirmation_ids.add(result["confirmation_id"])
-                shown = present(name, result)
+                    confirmation = booking_confirmation(shown)
                 log(f"tool {name}({json.dumps(raw_args)}) -> {json.dumps(shown)}")
                 self.messages.append(
                     {"role": "tool", "content": json.dumps(shown), "tool_name": name}
                 )
+
+            if confirmation:
+                return self.say(confirmation)
 
         log("hit MAX_TOOL_ROUNDS")
         return self.say(GENERIC_FALLBACK)
