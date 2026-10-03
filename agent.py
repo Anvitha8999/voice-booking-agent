@@ -166,7 +166,8 @@ def warm_up() -> None:
 
 
 class Session:
-    def __init__(self) -> None:
+    def __init__(self, caller_phone: str | None = None) -> None:
+        self.caller_phone = caller_phone
         self.messages: list = [{"role": "system", "content": system_prompt(dt.date.today())}]
         self.checked_dates: set[dt.date] = set()
         self.confirmation_ids: set[str] = set()
@@ -209,6 +210,8 @@ class Session:
                 return {"error": "The caller has not said yes yet. Ask: Shall I book TIME on DATE for NAME?"}
             if writes_this_turn >= 1:
                 return {"error": "Only one booking is allowed per turn."}
+            if self.caller_phone:
+                args = args.model_copy(update={"phone": self.caller_phone})
 
         return spec["func"](args)
 
