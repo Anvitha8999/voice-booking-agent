@@ -1,5 +1,7 @@
 - **Observability:** structured JSON logs keyed by call SID, latency/error metrics (p50/p95 turn latency, tool error and guardrail-block rates), and alerting
 
+![tests](https://github.com/Anvitha8999/voice-booking-agent/actions/workflows/tests.yml/badge.svg)
+
 # Voice Booking Agent
 
 A fully local, free voice AI agent that books appointments. You talk to it; it transcribes your speech, decides when to check availability or book, enforces business rules in code, and talks back. No cloud AI APIs.
@@ -52,10 +54,12 @@ The agent (`agent.py`) is text in, text out. The Mac voice loop and the phone se
 | Speech-to-text (faster-whisper `base.en`, int8, CPU) | ~0.4–0.8 s |
 | LLM per call (qwen2.5:3b, warm) | ~1–2.6 s |
 | Text-to-speech, first audio (Piper, warm) | ~0.1–0.2 s |
+| Tool execution, in-process (availability check, booking) | ~0.25–4.3 ms |
+| HTTP tool endpoint, localhost (warm; first request ~49 ms) | ~1–2 ms |
 | **Typical turn** (end of speech → first audio) | **~1.5–2.8 s**, plus 0.7 s silence detection |
 | **Booking turn** | 6.5 s → **2.8 s** after replacing the second LLM call with a template |
 | First turn | 6.9 s → ~2.6 s after warming up with the real prompt and tools |
-The LLM is the bottleneck, so optimization focused there: fewer LLM calls per turn, a shorter prompt, and prompt-cache warm-up.
+Tool execution is under 1% of even the fastest LLM call, so optimization focused on the LLM: fewer LLM calls per turn, a shorter prompt, and prompt-cache warm-up.
 
 ## Phone integration (Twilio Media Streams)
 
