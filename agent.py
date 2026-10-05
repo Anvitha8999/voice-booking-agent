@@ -178,7 +178,9 @@ class Session:
         day = resolve_date(user_text, dt.date.today())
         if day is None:
             return None
+        start = time.perf_counter()
         result = check_availability(CheckAvailabilityArgs(date=day))
+        log(f"availability check took {(time.perf_counter() - start) * 1000:.2f} ms")
         self.checked_dates.add(day)
         shown = present("check_availability", {**result, "date": day.isoformat()})
         log(f"prefetch {day.isoformat()} -> {json.dumps(shown)}")
@@ -213,7 +215,10 @@ class Session:
             if self.caller_phone:
                 args = args.model_copy(update={"phone": self.caller_phone})
 
-        return spec["func"](args)
+        start = time.perf_counter()
+        result = spec["func"](args)
+        log(f"tool {name} executed in {(time.perf_counter() - start) * 1000:.2f} ms")
+        return result
 
     def say(self, text: str) -> str:
         """Record a code-generated reply in history so the model knows it was said."""
