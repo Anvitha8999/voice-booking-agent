@@ -1,3 +1,5 @@
+- **Observability:** structured JSON logs keyed by call SID, latency/error metrics (p50/p95 turn latency, tool error and guardrail-block rates), and alerting
+
 # Voice Booking Agent
 
 A fully local, free voice AI agent that books appointments. You talk to it; it transcribes your speech, decides when to check availability or book, enforces business rules in code, and talks back. No cloud AI APIs.
